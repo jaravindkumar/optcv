@@ -48,62 +48,80 @@ const fetchGitHub = async (input) => {
 
 const readFile = (file) => new Promise((resolve, reject) => {
   const reader = new FileReader()
-  reader.onload = e => resolve(e.target.result)
+  const isPDF = file.name.toLowerCase().endsWith('.pdf')
+  reader.onload = e => {
+    if (isPDF) {
+      // For PDFs, convert to base64 and send as document to Claude
+      const base64 = e.target.result.split(',')[1]
+      resolve({ type: 'pdf', base64, name: file.name })
+    } else {
+      resolve({ type: 'text', content: e.target.result })
+    }
+  }
   reader.onerror = reject
-  reader.readAsText(file)
+  if (isPDF) {
+    reader.readAsDataURL(file)
+  } else {
+    reader.readAsText(file)
+  }
 })
 
-const synthesise = async (sources) => {
+const synthesise = async (sources, pdfFiles) => {
   const sourceText = sources.map(s => `\n\n=== ${s.label} ===\n${s.content}`).join('')
+
+  // Build message content — text + any PDFs as documents
+  const content = []
+
+  // Add PDFs as document blocks
+  if (pdfFiles && pdfFiles.length > 0) {
+    for (const pdf of pdfFiles) {
+      content.push({
+        type: 'document',
+        source: {
+          type: 'base64',
+          media_type: 'application/pdf',
+          data: pdf.base64
+        },
+        title: pdf.name,
+      })
+    }
+  }
+
+  // Add text prompt
+  content.push({
+    type: 'text',
+    text: `You are a profile intelligence engine. Analyse ALL the sources below (including any PDF documents above) and synthesise a single rich structured master profile.
+
+${sourceText.length > 0 ? `Additional text sources:${sourceText}` : ''}
+
+Return ONLY a valid JSON object. No markdown fences, no explanation, just the JSON:
+{"name":"full name","headline":"10-word professional headline","email":"if found else null","phone":"if found else null","location":"city, country","linkedin_url":"if found else null","github_url":"if found else null","website_url":"if found else null","summary":"3-sentence rich summary capturing unique value","years_experience":0,"seniority":"senior","skills":["skill1","skill2"],"languages_and_tools":["tool1"],"domains":["domain1"],"target_roles":["role1","role2"],"target_industries":["industry1"],"salary_expectation":"£80k-£110k","work_preference":"hybrid","experience":[{"role":"title","org":"company","period":"2020-Present","highlights":["achievement 1","achievement 2"]}],"education":[{"degree":"degree name","institution":"university","year":"2018"}],"projects":[{"name":"project","description":"what it does","tech_stack":["Python"],"url":"","significance":"what it shows"}],"publications_patents":["citation"],"writing_voice":"description","strengths":["strength1","strength2"],"gaps":["gap1"],"job_search_tips":["tip1","tip2","tip3"],"profile_completeness":85,"sources_used":["source1"]}`
+  })
+
   const res = await fetch('/api/claude', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 2000,
-      messages: [{
-        role: 'user',
-        content: `You are a profile intelligence engine. Analyse ALL sources below and synthesise a single rich structured master profile.
-
-Sources:${sourceText}
-
-Return ONLY raw JSON (no markdown fences):
-{
-  "name": "full name",
-  "headline": "10-word professional headline",
-  "email": "if found else null",
-  "phone": "if found else null",
-  "location": "city, country",
-  "linkedin_url": "if found",
-  "github_url": "if found",
-  "website_url": "if found",
-  "summary": "3-sentence rich summary capturing unique value",
-  "years_experience": number,
-  "seniority": "junior|mid|senior|principal",
-  "skills": ["top 20 skills ranked by evidence"],
-  "languages_and_tools": ["programming languages and tools"],
-  "domains": ["e.g. AI/ML, Digital Twins, Sports Tech"],
-  "target_roles": ["3-5 specific role titles"],
-  "target_industries": ["2-4 industries"],
-  "salary_expectation": "e.g. £80k-£110k",
-  "work_preference": "remote|hybrid|onsite|flexible",
-  "experience": [{"role":"","org":"","period":"","highlights":["2-3 achievement bullets"]}],
-  "education": [{"degree":"","institution":"","year":""}],
-  "projects": [{"name":"","description":"","tech_stack":[],"url":"","significance":""}],
-  "publications_patents": ["formatted citations"],
-  "writing_voice": "2-sentence description of communication style",
-  "strengths": ["3-5 genuine differentiators"],
-  "gaps": ["honest missing signals"],
-  "job_search_tips": ["3 specific actionable tips"],
-  "profile_completeness": number 0-100,
-  "sources_used": ["list of useful source labels"]
-}`
-      }]
+      messages: [{ role: 'user', content }]
     })
   })
+
   const d = await res.json()
-  const text = d.content?.[0]?.text || '{}'
-  return JSON.parse(text.replace(/```json|```/g, '').trim())
+
+  // Handle API errors
+  if (d.error) throw new Error(d.error.message || 'Claude API error')
+
+  const text = d.content?.[0]?.text || ''
+  if (!text) throw new Error('Empty response from Claude')
+
+  // Clean and parse — extract JSON even if there is surrounding text
+  const cleaned = text.replace(/```json|```/g, '').trim()
+  const jsonMatch = cleaned.match(/\{[\s\S]*\}/)
+  if (!jsonMatch) throw new Error('No JSON found in response')
+
+  return JSON.parse(jsonMatch[0])
 }
 
 function Pill({ label, color = 'default', small }) {
@@ -207,23 +225,31 @@ export default function ProfileIngestor() {
         sources.push({label:lbl,content:c}); setStatus(`extra${i}`,'done'); addLog(`${lbl} read successfully`,'done')
       } catch(e) { setStatus(`extra${i}`,'error'); addLog(`URL ${i+1}: ${e.message}`,'error') }
     }
+    const pdfFiles = []
     if (files.length>0) {
       setStatus('files','loading'); addLog(`Reading ${files.length} uploaded file(s)...`)
       try {
         for (const f of files) {
-          const c=await readFile(f)
-          const lbl=f.name.toLowerCase().includes('cover')?'Cover Letter':f.name.toLowerCase().includes('cv')||f.name.toLowerCase().includes('resume')?'CV / Resume':'Uploaded Document'
-          sources.push({label:lbl,content:c.slice(0,8000)}); addLog(`${lbl}: ${f.name} read`,'done')
+          const result = await readFile(f)
+          const lbl = f.name.toLowerCase().includes('cover')?'Cover Letter':f.name.toLowerCase().includes('cv')||f.name.toLowerCase().includes('resume')?'CV / Resume':'Uploaded Document'
+          if (result.type === 'pdf') {
+            pdfFiles.push({ ...result, label: lbl })
+            addLog(`${lbl}: ${f.name} read as PDF`,'done')
+          } else {
+            sources.push({ label: lbl, content: result.content.slice(0, 6000) })
+            addLog(`${lbl}: ${f.name} read`,'done')
+          }
         }
         setStatus('files','done')
       } catch(e) { setStatus('files','error'); addLog(`File read failed: ${e.message}`,'error') }
     }
 
-    if (sources.length===0) { addLog('No sources could be read. Check your inputs.','error'); setRunning(false); return }
+    if (sources.length===0 && pdfFiles.length===0) { addLog('No sources could be read. Check your inputs.','error'); setRunning(false); return }
 
-    setStatus('synthesis','loading'); addLog(`Synthesising ${sources.length} source(s) with Claude...`)
+    const totalSources = sources.length + pdfFiles.length
+    setStatus('synthesis','loading'); addLog(`Synthesising ${totalSources} source(s) with Claude...`)
     try {
-      const p = await synthesise(sources)
+      const p = await synthesise(sources, pdfFiles)
       setProfile(p); setStatus('synthesis','done')
       addLog(`Profile built — completeness score: ${p.profile_completeness}/100`,'done')
       addLog(`Found ${p.skills?.length||0} skills · ${p.experience?.length||0} roles · ${p.projects?.length||0} projects`,'done')
